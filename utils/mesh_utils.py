@@ -273,7 +273,6 @@ class GaussianExtractor(object):
         else:
             STRIDE = 6
             point_cloud_hint = []
-            point_cloud_hint_normals_debug = []
             from utils.point_utils import depths_to_points
             for i, viewpoint_cam in enumerate(self.viewpoint_stack):
                 points = depths_to_points(viewpoint_cam, self.depthmaps[i].cuda())[::STRIDE]
@@ -284,7 +283,7 @@ class GaussianExtractor(object):
             import IsoOctree
             iso_function = lambda x: compute_unbounded_tsdf(x, False, voxel_size).cpu().numpy()
             mesh = IsoOctree.buildMeshWithPointCloudHint(
-                sdf_function,
+                iso_function,
                 point_cloud_hint,
                 maxDepth=10,
                 subdivisionThreshold=50,
