@@ -115,7 +115,7 @@ class GaussianExtractor(object):
             # self.alphamaps.append(alpha.cpu())
             # self.normals.append(normal.cpu())
             # self.depth_normals.append(depth_normal.cpu())
-        
+
         # self.rgbmaps = torch.stack(self.rgbmaps, dim=0)
         # self.depthmaps = torch.stack(self.depthmaps, dim=0)
         # self.alphamaps = torch.stack(self.alphamaps, dim=0)
@@ -244,7 +244,6 @@ class GaussianExtractor(object):
             
             if return_rgb:
                 return tsdfs, rgbs
-
             return tsdfs
 
         normalize = lambda x: (x - self.center) / self.radius
@@ -261,15 +260,36 @@ class GaussianExtractor(object):
         R = np.quantile(R, q=0.95)
         R = min(R+0.01, 1.9)
 
-        mesh = marching_cubes_with_contraction(
-            sdf=sdf_function,
-            bounding_box_min=(-R, -R, -R),
-            bounding_box_max=(R, R, R),
-            level=0,
-            resolution=N,
-            inv_contraction=inv_contraction,
-        )
-        
+        USE_ISOOCTREE = True
+        if not USE_ISOOCTREE:
+            mesh = marching_cubes_with_contraction(
+                sdf=sdf_function,
+                bounding_box_min=(-R, -R, -R),
+                bounding_box_max=(R, R, R),
+                level=0,
+                resolution=N,
+                inv_contraction=inv_contraction,
+            )
+        else:
+            STRIDE = 6
+            point_cloud_hint = []
+            point_cloud_hint_normals_debug = []
+            from utils.point_utils import depths_to_points
+            for i, viewpoint_cam in enumerate(self.viewpoint_stack):
+                points = depths_to_points(viewpoint_cam, self.depthmaps[i].cuda())[::STRIDE]
+                points = points.cpu().numpy()
+                point_cloud_hint.append(points)
+
+            point_cloud_hint = np.vstack(point_cloud_hint)
+            import IsoOctree
+            iso_function = lambda x: compute_unbounded_tsdf(x, inv_contraction, voxel_size).cpu().numpy()
+            mesh = IsoOctree.buildMeshWithPointCloudHint(
+                sdf_function,
+                point_cloud_hint,
+                maxDepth=10,
+                subdivisionThreshold=50,
+            )
+
         # coloring the mesh
         torch.cuda.empty_cache()
         mesh = mesh.as_open3d
