@@ -27,6 +27,19 @@ def writeMeshAsObj(mesh, filename):
         for t in mesh.triangles:
             f.write('f %d %d %d\n' % (t[0]+1, t[1]+1, t[2]+1))
 
+def write_debug_ply(ply_file_path, points, normals=None, colors=None):
+    import open3d as o3d
+
+    point_cloud = o3d.geometry.PointCloud()
+    point_cloud.points = o3d.utility.Vector3dVector(points)
+    if normals is not None:
+        point_cloud.normals = o3d.utility.Vector3dVector(normals)
+    if colors is not None:
+        point_cloud.colors = o3d.utility.Vector3dVector(colors)
+
+    # Write the point cloud to a PLY file
+    o3d.io.write_point_cloud(ply_file_path, point_cloud)
+
 def post_process_mesh(mesh, cluster_to_keep=1000):
     """
     Post-process a mesh to filter out floaters and disconnected parts
@@ -333,9 +346,26 @@ class GaussianExtractor(object):
                 point_cloud_hint.append(points)
 
             point_cloud_hint = np.vstack(point_cloud_hint)
-            import IsoOctree
-            iso_function = lambda x: numpy_compute_unbounded_tsdf(x, None, voxel_size)
+            debug_ply_file = os.getcwd() + "/debug_ply.ply"
+            if debug_ply_file is not None:
+                write_debug_ply(debug_ply_file, point_cloud_hint)
 
+            # Debug
+            DEBUG = False
+            if DEBUG:
+                random_points = point_cloud_hint[np.random.choice(point_cloud_hint.shape[0], 100000, replace=False)]
+                RADIUS = 0.01
+                def debug_iso(samples, random_points = random_points):
+                    distances = np.linalg.norm(samples[:, np.newaxis] - random_points, axis=2)
+                    distances = distances / distances.max()
+                    min_distances = np.min(distances, axis=1)
+                    values = min_distances - RADIUS
+                    return values
+                iso_function = lambda x : debug_iso(x, random_points = random_points)
+            else:
+                iso_function = lambda x: numpy_compute_unbounded_tsdf(x, inv_contraction, voxel_size)
+
+            import IsoOctree
             mesh = IsoOctree.buildMeshWithPointCloudHint(
                 iso_function,
                 point_cloud_hint,
@@ -343,7 +373,7 @@ class GaussianExtractor(object):
                 subdivisionThreshold=50,
             )
             writeMeshAsObj(mesh, os.getcwd()+"/debug_iso.obj")
-
+            quit()
         if not USE_ISOOCTREE:
             print("texturing mesh ... ")
             _, rgbs = compute_unbounded_tsdf(torch.tensor(np.asarray(mesh.vertices)).float().cuda(), inv_contraction=None, voxel_size=voxel_size, return_rgb=True)
