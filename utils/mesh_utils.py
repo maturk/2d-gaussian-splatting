@@ -282,7 +282,7 @@ class GaussianExtractor(object):
 
             point_cloud_hint = np.vstack(point_cloud_hint)
             import IsoOctree
-            iso_function = lambda x: compute_unbounded_tsdf(x, inv_contraction, voxel_size).cpu().numpy()
+            iso_function = lambda x: compute_unbounded_tsdf(x, False, voxel_size).cpu().numpy()
             mesh = IsoOctree.buildMeshWithPointCloudHint(
                 sdf_function,
                 point_cloud_hint,
