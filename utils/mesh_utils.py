@@ -225,7 +225,7 @@ class GaussianExtractor(object):
             mask_proj = ((pix_coords > -1. ) & (pix_coords < 1.) & (z > 0)).all(dim=-1)
             sampled_depth = torch.nn.functional.grid_sample(depthmap.cuda()[None], pix_coords[None, None], mode='bilinear', padding_mode='border', align_corners=True).reshape(-1, 1)
             sampled_rgb = torch.nn.functional.grid_sample(rgbmap.cuda()[None], pix_coords[None, None], mode='bilinear', padding_mode='border', align_corners=True).reshape(3,-1).T
-            sdf = (sampled_depth-z)
+            sdf = (sampled_depth-z) # depth from depth_map - projected_depth
             return sdf, sampled_rgb, mask_proj
 
         def compute_unbounded_tsdf(samples, inv_contraction, voxel_size, return_rgb=False):
@@ -245,13 +245,12 @@ class GaussianExtractor(object):
             rgbs = torch.zeros((samples.shape[0], 3)).cuda()
 
             weights = torch.ones_like(samples[:,0])
-            for i, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc="TSDF integration progress"):
+            for i, viewpoint_cam in enumerate(self.viewpoint_stack):
                 sdf, rgb, mask_proj = compute_sdf_perframe(i, samples,
                     depthmap = self.depthmaps[i],
                     rgbmap = self.rgbmaps[i],
                     viewpoint_cam=self.viewpoint_stack[i],
                 )
-
                 # volume integration
                 sdf = sdf.flatten()
                 mask_proj = mask_proj & (sdf > -sdf_trunc)
@@ -262,10 +261,10 @@ class GaussianExtractor(object):
                 rgbs[mask_proj] = (rgbs[mask_proj] * w[:,None] + rgb[mask_proj]) / wp[:,None]
                 # update weight
                 weights[mask_proj] = wp
-
             if return_rgb:
                 return tsdfs, rgbs
-
+            #print(tsdfs)
+            print(torch.count_nonzero(tsdfs<1))
             return tsdfs
 
         def numpy_compute_unbounded_tsdf(samples, inv_contraction, voxel_size, return_rgb=False):
@@ -281,18 +280,15 @@ class GaussianExtractor(object):
                 samples = inv_contraction(samples)
             else:
                 sdf_trunc = 5 * voxel_size
-
             tsdfs = torch.ones_like(samples[:,0]) * 1
             rgbs = torch.zeros((samples.shape[0], 3)).cuda()
-
             weights = torch.ones_like(samples[:,0])
-            for i, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc="TSDF integration progress"):
+            for i, viewpoint_cam in enumerate(self.viewpoint_stack):
                 sdf, rgb, mask_proj = compute_sdf_perframe(i, samples,
                     depthmap = self.depthmaps[i],
                     rgbmap = self.rgbmaps[i],
                     viewpoint_cam=self.viewpoint_stack[i],
                 )
-
                 # volume integration
                 sdf = sdf.flatten()
                 mask_proj = mask_proj & (sdf > -sdf_trunc)
@@ -303,16 +299,18 @@ class GaussianExtractor(object):
                 rgbs[mask_proj] = (rgbs[mask_proj] * w[:,None] + rgb[mask_proj]) / wp[:,None]
                 # update weight
                 weights[mask_proj] = wp
-
             if return_rgb:
                 return tsdfs, rgbs
-
+            
+            print(sdf)
+            print("voxel size ", voxel_size)
+            print("print tsfds", torch.count_nonzero(tsdfs<1))
             return tsdfs.cpu().numpy()
 
         normalize = lambda x: (x - self.center) / self.radius
         unnormalize = lambda x: (x * self.radius) + self.center
-        inv_contraction = lambda x: unnormalize(uncontract(x))
-
+        #inv_contraction = lambda x: unnormalize(uncontract(x))
+        inv_contraction = None
         N = resolution
         voxel_size = (self.radius * 2 / N)
         print(f"Computing sdf gird resolution {N} x {N} x {N}")
@@ -337,23 +335,30 @@ class GaussianExtractor(object):
             torch.cuda.empty_cache()
             mesh = mesh.as_open3d
         else:
-            STRIDE = 1000
+            STRIDE = 100
             point_cloud_hint = []
             from utils.point_utils import depths_to_points
             for i, viewpoint_cam in enumerate(self.viewpoint_stack):
-                points = depths_to_points(viewpoint_cam, self.depthmaps[i].cuda())[::STRIDE]
+                points = depths_to_points(viewpoint_cam, self.depthmaps[i].cuda())
                 points = points.cpu().numpy()
                 point_cloud_hint.append(points)
 
             point_cloud_hint = np.vstack(point_cloud_hint)
+            point_cloud_hint = point_cloud_hint[::STRIDE]
+
+            # remove points far away from center of object
+            center_point = np.mean(point_cloud_hint, axis=0)
+            distances = np.linalg.norm(point_cloud_hint - center_point, axis=1)
+            FILTER_RADIUS = np.quantile(distances, q=0.6)
+            point_cloud_hint = point_cloud_hint[distances <= FILTER_RADIUS]
             debug_ply_file = os.getcwd() + "/debug_ply.ply"
             if debug_ply_file is not None:
                 write_debug_ply(debug_ply_file, point_cloud_hint)
 
-            # Debug
+            # Debug iso_function
             DEBUG = False
             if DEBUG:
-                random_points = point_cloud_hint[np.random.choice(point_cloud_hint.shape[0], 100000, replace=False)]
+                random_points = point_cloud_hint[np.random.choice(point_cloud_hint.shape[0], 100, replace=False)]
                 RADIUS = 0.01
                 def debug_iso(samples, random_points = random_points):
                     distances = np.linalg.norm(samples[:, np.newaxis] - random_points, axis=2)
@@ -363,14 +368,15 @@ class GaussianExtractor(object):
                     return values
                 iso_function = lambda x : debug_iso(x, random_points = random_points)
             else:
-                iso_function = lambda x: numpy_compute_unbounded_tsdf(x, inv_contraction, voxel_size)
+                iso_octree_tsdf_voxel_size = 0.1
+                iso_function = lambda x: numpy_compute_unbounded_tsdf(x, None, voxel_size=iso_octree_tsdf_voxel_size)
 
             import IsoOctree
             mesh = IsoOctree.buildMeshWithPointCloudHint(
                 iso_function,
                 point_cloud_hint,
-                maxDepth=10,
-                subdivisionThreshold=50,
+                maxDepth=30,
+                subdivisionThreshold=5,
             )
             writeMeshAsObj(mesh, os.getcwd()+"/debug_iso.obj")
             quit()
