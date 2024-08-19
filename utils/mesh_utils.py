@@ -19,6 +19,27 @@ from functools import partial
 import open3d as o3d
 import trimesh
 
+def writeMeshAsObj(mesh, filename):
+    print('writing', filename)
+    with open(filename, 'wt') as f:
+        for v in mesh.vertices:
+            f.write('v %f %f %f\n' % (v[0], v[1], v[2]))
+        for t in mesh.triangles:
+            f.write('f %d %d %d\n' % (t[0]+1, t[1]+1, t[2]+1))
+
+def write_debug_ply(ply_file_path, points, normals=None, colors=None):
+    import open3d as o3d
+
+    point_cloud = o3d.geometry.PointCloud()
+    point_cloud.points = o3d.utility.Vector3dVector(points)
+    if normals is not None:
+        point_cloud.normals = o3d.utility.Vector3dVector(normals)
+    if colors is not None:
+        point_cloud.colors = o3d.utility.Vector3dVector(colors)
+
+    # Write the point cloud to a PLY file
+    o3d.io.write_point_cloud(ply_file_path, point_cloud)
+
 def post_process_mesh(mesh, cluster_to_keep=1000):
     """
     Post-process a mesh to filter out floaters and disconnected parts
@@ -115,7 +136,7 @@ class GaussianExtractor(object):
             # self.alphamaps.append(alpha.cpu())
             # self.normals.append(normal.cpu())
             # self.depth_normals.append(depth_normal.cpu())
-        
+
         # self.rgbmaps = torch.stack(self.rgbmaps, dim=0)
         # self.depthmaps = torch.stack(self.depthmaps, dim=0)
         # self.alphamaps = torch.stack(self.alphamaps, dim=0)
@@ -204,7 +225,7 @@ class GaussianExtractor(object):
             mask_proj = ((pix_coords > -1. ) & (pix_coords < 1.) & (z > 0)).all(dim=-1)
             sampled_depth = torch.nn.functional.grid_sample(depthmap.cuda()[None], pix_coords[None, None], mode='bilinear', padding_mode='border', align_corners=True).reshape(-1, 1)
             sampled_rgb = torch.nn.functional.grid_sample(rgbmap.cuda()[None], pix_coords[None, None], mode='bilinear', padding_mode='border', align_corners=True).reshape(3,-1).T
-            sdf = (sampled_depth-z)
+            sdf = (sampled_depth-z) # depth from depth_map - projected_depth
             return sdf, sampled_rgb, mask_proj
 
         def compute_unbounded_tsdf(samples, inv_contraction, voxel_size, return_rgb=False):
@@ -224,13 +245,12 @@ class GaussianExtractor(object):
             rgbs = torch.zeros((samples.shape[0], 3)).cuda()
 
             weights = torch.ones_like(samples[:,0])
-            for i, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc="TSDF integration progress"):
+            for i, viewpoint_cam in enumerate(self.viewpoint_stack):
                 sdf, rgb, mask_proj = compute_sdf_perframe(i, samples,
                     depthmap = self.depthmaps[i],
                     rgbmap = self.rgbmaps[i],
                     viewpoint_cam=self.viewpoint_stack[i],
                 )
-
                 # volume integration
                 sdf = sdf.flatten()
                 mask_proj = mask_proj & (sdf > -sdf_trunc)
@@ -241,16 +261,56 @@ class GaussianExtractor(object):
                 rgbs[mask_proj] = (rgbs[mask_proj] * w[:,None] + rgb[mask_proj]) / wp[:,None]
                 # update weight
                 weights[mask_proj] = wp
-            
             if return_rgb:
                 return tsdfs, rgbs
-
+            #print(tsdfs)
+            print(torch.count_nonzero(tsdfs<1))
             return tsdfs
+
+        def numpy_compute_unbounded_tsdf(samples, inv_contraction, voxel_size, return_rgb=False):
+            """
+                Fusion all frames, perform adaptive sdf_funcation on the contract spaces.
+            """
+            samples = torch.from_numpy(samples).cuda().float()
+            if inv_contraction is not None:
+                mask = torch.linalg.norm(samples, dim=-1) > 1
+                # adaptive sdf_truncation
+                sdf_trunc = 5 * voxel_size * torch.ones_like(samples[:, 0])
+                sdf_trunc[mask] *= 1/(2-torch.linalg.norm(samples, dim=-1)[mask].clamp(max=1.9))
+                samples = inv_contraction(samples)
+            else:
+                sdf_trunc = 5 * voxel_size
+            tsdfs = torch.ones_like(samples[:,0]) * 1
+            rgbs = torch.zeros((samples.shape[0], 3)).cuda()
+            weights = torch.ones_like(samples[:,0])
+            for i, viewpoint_cam in enumerate(self.viewpoint_stack):
+                sdf, rgb, mask_proj = compute_sdf_perframe(i, samples,
+                    depthmap = self.depthmaps[i],
+                    rgbmap = self.rgbmaps[i],
+                    viewpoint_cam=self.viewpoint_stack[i],
+                )
+                # volume integration
+                sdf = sdf.flatten()
+                mask_proj = mask_proj & (sdf > -sdf_trunc)
+                sdf = torch.clamp(sdf / sdf_trunc, min=-1.0, max=1.0)[mask_proj]
+                w = weights[mask_proj]
+                wp = w + 1
+                tsdfs[mask_proj] = (tsdfs[mask_proj] * w + sdf) / wp
+                rgbs[mask_proj] = (rgbs[mask_proj] * w[:,None] + rgb[mask_proj]) / wp[:,None]
+                # update weight
+                weights[mask_proj] = wp
+            if return_rgb:
+                return tsdfs, rgbs
+            
+            print(sdf)
+            print("voxel size ", voxel_size)
+            print("print tsfds", torch.count_nonzero(tsdfs<1))
+            return tsdfs.cpu().numpy()
 
         normalize = lambda x: (x - self.center) / self.radius
         unnormalize = lambda x: (x * self.radius) + self.center
-        inv_contraction = lambda x: unnormalize(uncontract(x))
-
+        #inv_contraction = lambda x: unnormalize(uncontract(x))
+        inv_contraction = None
         N = resolution
         voxel_size = (self.radius * 2 / N)
         print(f"Computing sdf gird resolution {N} x {N} x {N}")
@@ -261,21 +321,69 @@ class GaussianExtractor(object):
         R = np.quantile(R, q=0.95)
         R = min(R+0.01, 1.9)
 
-        mesh = marching_cubes_with_contraction(
-            sdf=sdf_function,
-            bounding_box_min=(-R, -R, -R),
-            bounding_box_max=(R, R, R),
-            level=0,
-            resolution=N,
-            inv_contraction=inv_contraction,
-        )
-        
-        # coloring the mesh
-        torch.cuda.empty_cache()
-        mesh = mesh.as_open3d
-        print("texturing mesh ... ")
-        _, rgbs = compute_unbounded_tsdf(torch.tensor(np.asarray(mesh.vertices)).float().cuda(), inv_contraction=None, voxel_size=voxel_size, return_rgb=True)
-        mesh.vertex_colors = o3d.utility.Vector3dVector(rgbs.cpu().numpy())
+        USE_ISOOCTREE = True
+        if not USE_ISOOCTREE:
+            mesh = marching_cubes_with_contraction(
+                sdf=sdf_function,
+                bounding_box_min=(-R, -R, -R),
+                bounding_box_max=(R, R, R),
+                level=0,
+                resolution=N,
+                inv_contraction=inv_contraction,
+            )
+            # coloring the mesh
+            torch.cuda.empty_cache()
+            mesh = mesh.as_open3d
+        else:
+            STRIDE = 100
+            point_cloud_hint = []
+            from utils.point_utils import depths_to_points
+            for i, viewpoint_cam in enumerate(self.viewpoint_stack):
+                points = depths_to_points(viewpoint_cam, self.depthmaps[i].cuda())
+                points = points.cpu().numpy()
+                point_cloud_hint.append(points)
+
+            point_cloud_hint = np.vstack(point_cloud_hint)
+            point_cloud_hint = point_cloud_hint[::STRIDE]
+
+            # remove points far away from center of object
+            center_point = np.mean(point_cloud_hint, axis=0)
+            distances = np.linalg.norm(point_cloud_hint - center_point, axis=1)
+            FILTER_RADIUS = np.quantile(distances, q=0.6)
+            point_cloud_hint = point_cloud_hint[distances <= FILTER_RADIUS]
+            debug_ply_file = os.getcwd() + "/debug_ply.ply"
+            if debug_ply_file is not None:
+                write_debug_ply(debug_ply_file, point_cloud_hint)
+
+            # Debug iso_function
+            DEBUG = False
+            if DEBUG:
+                random_points = point_cloud_hint[np.random.choice(point_cloud_hint.shape[0], 100, replace=False)]
+                RADIUS = 0.01
+                def debug_iso(samples, random_points = random_points):
+                    distances = np.linalg.norm(samples[:, np.newaxis] - random_points, axis=2)
+                    distances = distances / distances.max()
+                    min_distances = np.min(distances, axis=1)
+                    values = min_distances - RADIUS
+                    return values
+                iso_function = lambda x : debug_iso(x, random_points = random_points)
+            else:
+                iso_octree_tsdf_voxel_size = 0.1
+                iso_function = lambda x: numpy_compute_unbounded_tsdf(x, None, voxel_size=iso_octree_tsdf_voxel_size)
+
+            import IsoOctree
+            mesh = IsoOctree.buildMeshWithPointCloudHint(
+                iso_function,
+                point_cloud_hint,
+                maxDepth=30,
+                subdivisionThreshold=5,
+            )
+            writeMeshAsObj(mesh, os.getcwd()+"/debug_iso.obj")
+            quit()
+        if not USE_ISOOCTREE:
+            print("texturing mesh ... ")
+            _, rgbs = compute_unbounded_tsdf(torch.tensor(np.asarray(mesh.vertices)).float().cuda(), inv_contraction=None, voxel_size=voxel_size, return_rgb=True)
+            mesh.vertex_colors = o3d.utility.Vector3dVector(rgbs.cpu().numpy())
         return mesh
 
     @torch.no_grad()
